@@ -72,27 +72,35 @@ def compute_component_score(raw: pd.Series, window: int, invert: bool, ema_span:
 # بناء جدول المكونات الموحّد
 # ----------------------------------------------------------------------------
 def build_components_dataframe(
-    stablecoin_df: pd.DataFrame,
+    stablecoin_supply_df: pd.DataFrame,
+    stablecoin_inflows_df: pd.DataFrame,
     btc_exchange_df: pd.DataFrame,
     btc_price_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
     يدمج كل مصادر البيانات على عمود date ويحسب القيم الخام لكل مكوّن
     (قبل التطبيع)، تمهيداً لحساب compute_fomo_index.
+
+    ملاحظة مهمة: stablecoin_inflows_df (Stablecoin Exchange Inflows) هو
+    المصدر الحصري للمكوّن الأهم في المؤشر (50%)، وهو منفصل تماماً عن
+    stablecoin_supply_df الذي يبقى فقط مكوّناً سياقياً بوزن منخفض (10%).
+    الفصل بينهما مقصود: نمو المعروض العالمي (إصدار جديد) لا يعني دخول
+    الأموال فعلياً لمنصات التداول.
     """
-    df = stablecoin_df.merge(btc_exchange_df, on="date", how="outer")
-    df = df.merge(btc_price_df, on="date", how="outer")
+    df = stablecoin_supply_df.merge(stablecoin_inflows_df, on="date", how="outer", suffixes=("", "_inflows"))
+    df = df.merge(btc_exchange_df, on="date", how="outer", suffixes=("", "_btc"))
+    df = df.merge(btc_price_df, on="date", how="outer", suffixes=("", "_price"))
     df = df.sort_values("date").reset_index(drop=True)
 
     # تعبئة أمامية بسيطة للفجوات القصيرة (لا تتجاوز 3 أيام) فقط
     df = df.ffill(limit=3)
 
-    # المكوّن 1: Stablecoin Inflows -> تغيّر نسبي قصير المدى (7 أيام) في المعروض
-    df["raw_stablecoin_inflows"] = df["stablecoin_supply"].pct_change(
-        periods=config.SHORT_TERM_WINDOW
-    ) * 100
+    # المكوّن 1 (الأهم، 50%): Stablecoin Exchange Inflows
+    # القيمة تأتي جاهزة كـ "تدفق" (Flow) من data_providers، فلا حاجة لأي
+    # pct_change إضافي — يُمرَّر مباشرة للتطبيع (Percentile Rank).
+    df["raw_stablecoin_exchange_inflows"] = df.get("stablecoin_exchange_inflow")
 
-    # المكوّن 4: Stablecoin Supply -> اتجاه طويل المدى (90 يوم)
+    # المكوّن 4 (سياقي فقط، 10%): Stablecoin Supply -> اتجاه طويل المدى (90 يوم)
     df["raw_stablecoin_supply"] = df["stablecoin_supply"].pct_change(
         periods=config.LONG_TERM_WINDOW
     ) * 100
@@ -118,7 +126,7 @@ def compute_fomo_index(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     raw_map = {
-        "stablecoin_inflows": "raw_stablecoin_inflows",
+        "stablecoin_exchange_inflows": "raw_stablecoin_exchange_inflows",
         "btc_exchange_netflow": "raw_btc_exchange_netflow",
         "btc_exchange_balance": "raw_btc_exchange_balance",
         "stablecoin_supply": "raw_stablecoin_supply",
@@ -177,8 +185,18 @@ def _apply_rate_limit(series: pd.Series, max_delta: float) -> pd.Series:
 
 
 def classify_value(value: float) -> Dict[str, str]:
-    """يرجع تصنيف نصي ولون للقيمة الحالية للمؤشر."""
+    """يرجع تصنيف الحالة (إنجليزي بأسلوب Fear & Greed)، تفسيراً قصيراً، ولوناً."""
     if value is None or np.isnan(value):
-        return {"label": "بيانات غير كافية", "color": "#9E9E9E"}
+        return {
+            "label_en": "Unavailable",
+            "label_ar": "بيانات غير كافية",
+            "explanation_ar": "لا تتوفر بيانات كافية لحساب المؤشر حالياً.",
+            "color": "#9E9E9E",
+        }
     zone = config.get_zone(value)
-    return {"label": zone.label_ar, "color": zone.color}
+    return {
+        "label_en": zone.label_en,
+        "label_ar": zone.label_ar,
+        "explanation_ar": zone.explanation_ar,
+        "color": zone.color,
+    }

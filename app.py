@@ -2,13 +2,36 @@
 """
 app.py
 ======
-لوحة تحكم FOMO Index — واجهة احترافية بأسلوب Bloomberg/TradingView
-باستخدام Python + Streamlit فقط (بدون React/JSX/Next.js).
+نقطة التشغيل الوحيدة لمشروع FOMO Index.
+
+تشغيل محلي:
+    streamlit run app.py
+
+تصميم الصفحة (بأسلوب Fear & Greed Index — بسيط واحترافي):
+    🔥 FOMO Index
+    [عداد Gauge كبير بالقيمة الحالية]
+    [الحالة: Very Low / Low / Neutral / High / Extreme FOMO]
+    [تفسير قصير سطر إلى سطرين]
+    [سعر BTC الحالي  |  تاريخ آخر تحديث]
+    [رسم بياني صغير لآخر 30 يوماً]
+
+لا يوجد أي عنصر تحكم يتطلب تدخل المستخدم (بدون أزرار، بدون قوائم اختيار،
+بدون صفحات إضافية). البيانات تُجلب وتُحسب تلقائياً عند فتح الصفحة،
+وتُخزَّن مؤقتاً (st.cache_data) لمدة ساعة، ويُعاد تحميل الصفحة تلقائياً
+كل ساعة عبر وسم HTML لإعادة التحديث (بدون أي مكتبة خارجية إضافية).
+
+مبدأ الموثوقية الأساسي في هذا الملف:
+    أي خطأ (شبكة، بيانات ناقصة، استثناء غير متوقع) يجب أن يُعالَج محلياً
+    ولا يُسمح له أبداً بإيقاف التطبيق أو إظهار شاشة عطل للمستخدم. في أسوأ
+    الحالات نعرض آخر قراءة محفوظة (persistence.py)، وإن لم توجد نعرض
+    رسالة "البيانات غير متوفرة حالياً" فقط.
 """
 
 from __future__ import annotations
 
-import numpy as np
+import logging
+from datetime import datetime, timezone
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -16,131 +39,188 @@ import streamlit as st
 import config
 import data_sources as ds
 import fomo_index as fi
+import persistence
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("fomo_index.app")
 
 # ------------------------------------------------------------------------
-# إعداد الصفحة
+# إعداد الصفحة (صفحة واحدة فقط، بدون قائمة جانبية أو صفحات إضافية)
 # ------------------------------------------------------------------------
 st.set_page_config(
     page_title="FOMO Index",
     page_icon="🔥",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+
+# إعادة تحميل الصفحة تلقائياً كل ساعة (بدون أي مكتبة خارجية إضافية)
+st.markdown(
+    f'<meta http-equiv="refresh" content="{config.AUTO_REFRESH_SECONDS}">',
+    unsafe_allow_html=True,
 )
 
 # ------------------------------------------------------------------------
-# الشريط الجانبي: إعدادات + وضع العرض
+# تصميم ثابت (بدون خيار تبديل — مظهر داكن احترافي دائم)
 # ------------------------------------------------------------------------
-with st.sidebar:
-    st.title("⚙️ الإعدادات")
-    dark_mode = st.toggle("الوضع الليلي", value=config.DEFAULT_DARK_MODE)
-    days_range = st.slider("مدى البيانات (أيام)", min_value=90, max_value=365, value=180, step=15)
-    st.divider()
-    refresh_clicked = st.button("🔄 تحديث البيانات الآن", use_container_width=True)
-    st.divider()
-    st.caption(
-        "المؤشر يعتمد فقط على حركة الأموال الفعلية (Stablecoin Flows + BTC "
-        "Exchange Flows) — لا يستخدم السعر أو المشاعر أو الأخبار في حسابه."
-    )
-    st.caption(f"آخر تحديث: {ds.get_last_update_str()}")
-
-# ------------------------------------------------------------------------
-# CSS مخصص — أسلوب Bloomberg/TradingView
-# ------------------------------------------------------------------------
-if dark_mode:
-    bg_color, card_bg, text_color, grid_color = "#0E1117", "#161B22", "#E6EDF3", "#30363D"
-else:
-    bg_color, card_bg, text_color, grid_color = "#F5F6FA", "#FFFFFF", "#1A1A1A", "#E0E0E0"
+BG_COLOR, CARD_BG, TEXT_COLOR, GRID_COLOR = "#0E1117", "#161B22", "#E6EDF3", "#30363D"
 
 st.markdown(
     f"""
     <style>
-    .stApp {{ background-color: {bg_color}; color: {text_color}; }}
-    div[data-testid="stMetric"] {{
-        background-color: {card_bg};
-        border: 1px solid {grid_color};
-        border-radius: 12px;
-        padding: 14px 16px;
+    .stApp {{ background-color: {BG_COLOR}; color: {TEXT_COLOR}; }}
+    #MainMenu, footer, header {{ visibility: hidden; }}
+    .fomo-title {{
+        text-align: center; font-size: 2.4rem; font-weight: 800; margin-bottom: 0;
     }}
-    .fomo-card {{
-        background-color: {card_bg};
-        border: 1px solid {grid_color};
-        border-radius: 14px;
-        padding: 18px 20px;
-        margin-bottom: 14px;
+    .fomo-status-badge {{
+        display: block; text-align: center; margin: 6px auto 14px auto;
+        padding: 6px 22px; border-radius: 999px; font-weight: 800;
+        font-size: 1.3rem; width: fit-content;
     }}
-    .fomo-badge {{
-        display: inline-block;
-        padding: 4px 14px;
-        border-radius: 999px;
-        font-weight: 700;
-        font-size: 0.95rem;
+    .fomo-explain {{
+        text-align: center; font-size: 1.02rem; color: {TEXT_COLOR};
+        opacity: 0.9; max-width: 560px; margin: 0 auto 18px auto; line-height: 1.6;
     }}
-    h1, h2, h3 {{ color: {text_color}; }}
+    .fomo-meta-row {{
+        display: flex; justify-content: center; gap: 40px; margin-bottom: 10px;
+        flex-wrap: wrap;
+    }}
+    .fomo-meta-item {{ text-align: center; }}
+    .fomo-meta-label {{ font-size: 0.85rem; opacity: 0.65; }}
+    .fomo-meta-value {{ font-size: 1.15rem; font-weight: 700; }}
+    .fomo-stale-banner {{
+        text-align: center; background-color: #3A2E12; color: #FFCA28;
+        border: 1px solid #FFCA2855; border-radius: 10px; padding: 8px 14px;
+        margin: 10px auto; max-width: 560px; font-size: 0.9rem;
+    }}
+    .fomo-unavailable {{
+        text-align: center; font-size: 1.6rem; font-weight: 700; margin-top: 60px;
+        color: {TEXT_COLOR};
+    }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("🔥 FOMO Index")
-st.caption("مؤشر يقيس درجة الفومو الحقيقية من خلال حركة الأموال الفعلية — وليس المشاعر أو السعر أو الأخبار.")
+st.markdown('<div class="fomo-title">🔥 FOMO Index</div>', unsafe_allow_html=True)
 
 
 # ------------------------------------------------------------------------
-# جلب وحساب البيانات (مع Cache)
+# الحساب الكامل للمؤشر — محاط بالكامل بمعالجة أخطاء شاملة
 # ------------------------------------------------------------------------
-@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner="جاري جلب البيانات وحساب المؤشر...")
-def load_and_compute(days: int) -> pd.DataFrame:
-    btc_market = ds.fetch_btc_market_data(days)
-    stable = ds.fetch_stablecoin_supply_history(days)
-    exch = ds.fetch_btc_exchange_metrics(days)
-    components = fi.build_components_dataframe(stable, exch, btc_market)
-    return fi.compute_fomo_index(components)
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
+def compute_index_cached():
+    """
+    يحاول حساب المؤشر الكامل. يُخزَّن الناتج لمدة ساعة (CACHE_TTL_SECONDS)
+    حتى لا يُعاد جلب البيانات عند كل Refresh للصفحة.
+
+    نجلب FETCH_DAYS_FOR_CALCULATION يوماً (وليس فقط 30) لأن حساب المؤشر
+    يحتاج نافذة تطبيع 180 يوماً + نافذة سياق 90 يوماً لتكون النتيجة دقيقة؛
+    الواجهة نفسها تعرض لاحقاً فقط آخر 30 يوماً منها.
+
+    أي استثناء غير متوقع يُلتقط هنا بالكامل ويُرجع None بدل إيقاف التطبيق.
+    """
+    days = config.FETCH_DAYS_FOR_CALCULATION
+    try:
+        btc_market = ds.fetch_btc_market_data(days)
+        stable_supply = ds.fetch_stablecoin_supply_history(days)
+        stable_inflows = ds.fetch_stablecoin_exchange_inflows(days)
+        exch = ds.fetch_btc_exchange_metrics(days)
+
+        if btc_market is None or btc_market.empty:
+            logger.error("لا توجد بيانات سعر BTC إطلاقاً — لا يمكن حساب المؤشر.")
+            return None
+
+        components = fi.build_components_dataframe(stable_supply, stable_inflows, exch, btc_market)
+        result = fi.compute_fomo_index(components)
+
+        if result is None or result.empty or result["fomo_index"].dropna().empty:
+            logger.error("نتيجة حساب المؤشر فارغة تماماً.")
+            return None
+
+        persistence.save_last_reading(result)  # نجاح -> نحفظها كآخر قراءة سليمة
+        return result
+
+    except Exception as exc:  # noqa: BLE001 — أي خطأ غير متوقع لا يجب أن يوقف التطبيق
+        logger.exception("خطأ غير متوقع أثناء حساب المؤشر: %s", exc)
+        return None
 
 
-if refresh_clicked:
-    load_and_compute.clear()
+# ------------------------------------------------------------------------
+# تحديد مصدر البيانات المعروضة: حساب حي، أو آخر قراءة محفوظة، أو رسالة عجز
+# ------------------------------------------------------------------------
+result = None
+is_stale = False
+saved_at_ts = None
 
-data = load_and_compute(days_range)
+try:
+    result = compute_index_cached()
+except Exception as exc:  # noqa: BLE001 — حماية إضافية حول استدعاء الكاش نفسه
+    logger.exception("فشل غير متوقع عند استدعاء compute_index_cached: %s", exc)
+    result = None
 
-if data.empty or data["fomo_index"].dropna().empty:
-    st.error("تعذّر حساب المؤشر — تحقق من الاتصال بالإنترنت أو حاول التحديث لاحقاً.")
+if result is None:
+    try:
+        saved = persistence.load_last_reading()
+    except Exception:  # noqa: BLE001
+        saved = None
+
+    if saved is not None:
+        result = saved["df"]
+        saved_at_ts = saved.get("saved_at")
+        is_stale = True
+    else:
+        st.markdown('<div class="fomo-unavailable">البيانات غير متوفرة حالياً</div>', unsafe_allow_html=True)
+        st.stop()
+
+# ------------------------------------------------------------------------
+# استخراج آخر قراءة صالحة بأمان تام (بدون أي KeyError / IndexError محتمل)
+# ------------------------------------------------------------------------
+try:
+    valid_rows = result.dropna(subset=["fomo_index"])
+    if valid_rows.empty:
+        st.markdown('<div class="fomo-unavailable">البيانات غير متوفرة حالياً</div>', unsafe_allow_html=True)
+        st.stop()
+
+    latest = valid_rows.iloc[-1]
+    current_value = float(latest["fomo_index"])
+    current_price = float(latest["btc_price"]) if "btc_price" in latest and pd.notna(latest["btc_price"]) else None
+    latest_date = latest["date"] if "date" in latest and pd.notna(latest["date"]) else None
+    zone = fi.classify_value(current_value)
+except Exception as exc:  # noqa: BLE001
+    logger.exception("خطأ أثناء استخراج آخر قراءة: %s", exc)
+    st.markdown('<div class="fomo-unavailable">البيانات غير متوفرة حالياً</div>', unsafe_allow_html=True)
     st.stop()
 
-is_proxy = bool(data.get("is_proxy", pd.Series([False])).fillna(False).any())
-is_fallback = bool(data.get("is_fallback", pd.Series([False])).fillna(False).any())
-
-latest = data.dropna(subset=["fomo_index"]).iloc[-1]
-current_value = float(latest["fomo_index"])
-current_price = float(latest["btc_price"]) if not np.isnan(latest["btc_price"]) else None
-zone = fi.classify_value(current_value)
-
-if is_proxy:
-    st.info(
-        "🧪 **Proxy Mode**: بيانات Exchange Netflow / Exchange Balance الحالية "
-        "تقديرية (مشتقة من حجم التداول العام) لعدم توفر مصدر مجاني حقيقي على "
-        "مستوى المنصات. يمكن استبدالها بسهولة ببيانات حقيقية (CryptoQuant/"
-        "Glassnode) بإضافة مفتاح API في config.py.",
-        icon="🧪",
+# ------------------------------------------------------------------------
+# تنبيه صغير إذا كانت هذه بيانات محفوظة (وليست حية الآن)
+# ------------------------------------------------------------------------
+if is_stale:
+    if saved_at_ts:
+        age_minutes = max(0, int((datetime.now(timezone.utc).timestamp() - saved_at_ts) / 60))
+        age_txt = f"منذ {age_minutes} دقيقة" if age_minutes < 120 else f"منذ {age_minutes // 60} ساعة"
+    else:
+        age_txt = ""
+    st.markdown(
+        f'<div class="fomo-stale-banner">⚠️ تعذّر الاتصال بمصادر البيانات حالياً — '
+        f'يتم عرض آخر قراءة سليمة محفوظة {age_txt}.</div>',
+        unsafe_allow_html=True,
     )
-if is_fallback:
-    st.warning("⚠️ تعذّر الاتصال بأحد مصادر البيانات — يتم عرض بيانات احتياطية اصطناعية مؤقتاً.")
-
 
 # ------------------------------------------------------------------------
-# الصف الأول: Gauge + مقاييس رئيسية
+# العداد الرئيسي (Gauge) — القيمة الحالية
 # ------------------------------------------------------------------------
-col_gauge, col_metrics = st.columns([1.1, 1.4])
-
-with col_gauge:
+try:
     fig_gauge = go.Figure(
         go.Indicator(
             mode="gauge+number",
             value=current_value,
-            number={"suffix": "", "font": {"size": 46, "color": zone["color"]}},
+            number={"font": {"size": 54, "color": zone["color"]}},
             gauge={
-                "axis": {"range": [0, 100], "tickwidth": 1, "tickcolor": text_color},
+                "axis": {"range": [0, 100], "tickwidth": 1, "tickcolor": TEXT_COLOR},
                 "bar": {"color": zone["color"], "thickness": 0.28},
-                "bgcolor": card_bg,
+                "bgcolor": CARD_BG,
                 "borderwidth": 0,
                 "steps": [
                     {"range": [0, 20], "color": "#1B3A20"},
@@ -153,125 +233,82 @@ with col_gauge:
         )
     )
     fig_gauge.update_layout(
-        height=320,
-        margin=dict(l=20, r=20, t=30, b=10),
-        paper_bgcolor=bg_color,
-        font={"color": text_color},
+        height=340,
+        margin=dict(l=20, r=20, t=20, b=0),
+        paper_bgcolor=BG_COLOR,
+        font={"color": TEXT_COLOR},
     )
-    st.plotly_chart(fig_gauge, use_container_width=True)
-    st.markdown(
-        f"<div style='text-align:center'><span class='fomo-badge' "
-        f"style='background-color:{zone['color']}22; color:{zone['color']}; "
-        f"border:1px solid {zone['color']}'>{zone['label']}</span></div>",
-        unsafe_allow_html=True,
-    )
+    st.plotly_chart(fig_gauge, use_container_width=True, config={"displayModeBar": False})
+except Exception as exc:  # noqa: BLE001
+    logger.exception("تعذّر رسم العداد: %s", exc)
+    st.markdown(f'<div class="fomo-title">{current_value:.1f}</div>', unsafe_allow_html=True)
 
-with col_metrics:
-    m1, m2, m3 = st.columns(3)
-    m1.metric("قيمة المؤشر", f"{current_value:.1f} / 100")
-    m2.metric("سعر BTC", f"${current_price:,.0f}" if current_price else "—")
-    prev = data.dropna(subset=["fomo_index"]).iloc[-2] if len(data.dropna(subset=["fomo_index"])) > 1 else None
-    delta = current_value - float(prev["fomo_index"]) if prev is not None else None
-    m3.metric("تغيّر يومي", f"{delta:+.1f}" if delta is not None else "—")
+# ------------------------------------------------------------------------
+# الحالة النصية + التفسير القصير
+# ------------------------------------------------------------------------
+st.markdown(
+    f'<span class="fomo-status-badge" style="background-color:{zone["color"]}22; '
+    f'color:{zone["color"]}; border:1px solid {zone["color"]}">{zone["label_en"]}</span>',
+    unsafe_allow_html=True,
+)
+st.markdown(f'<div class="fomo-explain">{zone["explanation_ar"]}</div>', unsafe_allow_html=True)
 
-    st.markdown("<div class='fomo-card'>", unsafe_allow_html=True)
-    st.subheader("مكونات المؤشر ومساهمتها")
-    contrib_cols = [c for c in data.columns if c.startswith("contribution_")]
-    contrib_row = latest[contrib_cols].fillna(0)
-    labels_ar = {
-        "contribution_stablecoin_inflows": "تدفقات Stablecoin (قصيرة المدى)",
-        "contribution_btc_exchange_netflow": "Exchange Netflow (BTC)",
-        "contribution_btc_exchange_balance": "Exchange Balance (BTC)",
-        "contribution_stablecoin_supply": "نمو معروض Stablecoin (طويل المدى)",
-    }
-    fig_bar = go.Figure(
-        go.Bar(
-            x=[contrib_row[c] for c in contrib_cols],
-            y=[labels_ar[c] for c in contrib_cols],
-            orientation="h",
-            marker_color=["#42A5F5", "#AB47BC", "#FFA726", "#66BB6A"],
+# ------------------------------------------------------------------------
+# سعر BTC الحالي + تاريخ آخر تحديث
+# ------------------------------------------------------------------------
+price_txt = f"${current_price:,.0f}" if current_price is not None else "—"
+date_txt = latest_date.strftime("%Y-%m-%d") if latest_date is not None else "—"
+
+st.markdown(
+    f"""
+    <div class="fomo-meta-row">
+        <div class="fomo-meta-item">
+            <div class="fomo-meta-label">سعر BTC الحالي</div>
+            <div class="fomo-meta-value">{price_txt}</div>
+        </div>
+        <div class="fomo-meta-item">
+            <div class="fomo-meta-label">تاريخ آخر تحديث</div>
+            <div class="fomo-meta-value">{date_txt}</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ------------------------------------------------------------------------
+# رسم بياني صغير — آخر 30 يوماً فقط، بدون أي أزرار أو تحكم
+# ------------------------------------------------------------------------
+try:
+    chart_df = valid_rows.tail(config.CHART_DISPLAY_DAYS)
+    if len(chart_df) >= 2:
+        fig_mini = go.Figure()
+        fig_mini.add_trace(
+            go.Scatter(
+                x=chart_df["date"],
+                y=chart_df["fomo_index"],
+                mode="lines",
+                line=dict(color=zone["color"], width=2.5),
+                fill="tozeroy",
+                fillcolor=f'{zone["color"]}22',
+            )
         )
-    )
-    fig_bar.update_layout(
-        height=220,
-        margin=dict(l=10, r=10, t=10, b=10),
-        paper_bgcolor=card_bg,
-        plot_bgcolor=card_bg,
-        font={"color": text_color},
-        xaxis_title="نقاط المساهمة",
-    )
-    st.plotly_chart(fig_bar, use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+        fig_mini.update_layout(
+            height=180,
+            margin=dict(l=10, r=10, t=10, b=10),
+            paper_bgcolor=BG_COLOR,
+            plot_bgcolor=BG_COLOR,
+            font={"color": TEXT_COLOR, "size": 11},
+            yaxis=dict(range=[0, 100], gridcolor=GRID_COLOR),
+            xaxis=dict(gridcolor=GRID_COLOR),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_mini, use_container_width=True, config={"displayModeBar": False})
+except Exception as exc:  # noqa: BLE001
+    logger.exception("تعذّر رسم الرسم البياني المصغر: %s", exc)
+    # لا نعرض شيئاً بدل الرسم — لا داعي لإزعاج المستخدم بخطأ فني هنا
 
-
-# ------------------------------------------------------------------------
-# الصف الثاني: رسوم بيانية زمنية
-# ------------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["📈 المؤشر عبر الزمن", "💰 سعر BTC", "🔀 مقارنة المؤشر مع السعر"])
-
-hist = data.dropna(subset=["fomo_index"])
-
-with tab1:
-    fig1 = go.Figure()
-    fig1.add_trace(go.Scatter(x=hist["date"], y=hist["fomo_index"], line=dict(color="#D32F2F", width=2), name="FOMO Index"))
-    for z in config.INDEX_ZONES:
-        fig1.add_hrect(y0=z.low, y1=min(z.high, 100), fillcolor=z.color, opacity=0.06, line_width=0)
-    fig1.update_layout(height=380, paper_bgcolor=bg_color, plot_bgcolor=bg_color, font={"color": text_color}, yaxis_range=[0, 100])
-    st.plotly_chart(fig1, use_container_width=True)
-
-with tab2:
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=hist["date"], y=hist["btc_price"], line=dict(color="#1976D2", width=2), name="BTC Price"))
-    fig2.update_layout(height=380, paper_bgcolor=bg_color, plot_bgcolor=bg_color, font={"color": text_color})
-    st.plotly_chart(fig2, use_container_width=True)
-
-with tab3:
-    fig3 = go.Figure()
-    fig3.add_trace(go.Scatter(x=hist["date"], y=hist["fomo_index"], name="FOMO Index", line=dict(color="#D32F2F"), yaxis="y1"))
-    fig3.add_trace(go.Scatter(x=hist["date"], y=hist["btc_price"], name="BTC Price", line=dict(color="#1976D2"), yaxis="y2"))
-    fig3.update_layout(
-        height=420,
-        paper_bgcolor=bg_color,
-        plot_bgcolor=bg_color,
-        font={"color": text_color},
-        yaxis=dict(title="FOMO Index", range=[0, 100], side="left"),
-        yaxis2=dict(title="BTC Price (USD)", overlaying="y", side="right"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-    )
-    st.plotly_chart(fig3, use_container_width=True)
-
-
-# ------------------------------------------------------------------------
-# الصف الثالث: جدول تاريخي + سجل آخر القراءات
-# ------------------------------------------------------------------------
-st.subheader("📋 السجل التاريخي")
-display_cols = {
-    "date": "التاريخ",
-    "fomo_index": "FOMO Index",
-    "btc_price": "سعر BTC",
-    "score_stablecoin_inflows": "Stablecoin Inflows",
-    "score_btc_exchange_netflow": "Exchange Netflow",
-    "score_btc_exchange_balance": "Exchange Balance",
-    "score_stablecoin_supply": "Stablecoin Supply",
-}
-table = hist[list(display_cols.keys())].rename(columns=display_cols).sort_values("التاريخ", ascending=False)
-table["FOMO Index"] = table["FOMO Index"].round(1)
-table["سعر BTC"] = table["سعر BTC"].round(0)
-
-last_readings, full_history = st.tabs(["آخر 15 قراءة", "السجل الكامل"])
-with last_readings:
-    st.dataframe(table.head(15), use_container_width=True, hide_index=True)
-with full_history:
-    st.dataframe(table, use_container_width=True, hide_index=True)
-    st.download_button(
-        "⬇️ تحميل السجل الكامل (CSV)",
-        data=table.to_csv(index=False).encode("utf-8-sig"),
-        file_name="fomo_index_history.csv",
-        mime="text/csv",
-    )
-
-st.divider()
-st.caption(
-    "⚠️ هذا المؤشر لأغراض تعليمية/تحليلية فقط وليس نصيحة استثمارية. "
-    "البيانات مصدرها CoinGecko و DeFiLlama (مجانية بالكامل)."
+st.markdown(
+    '<p style="text-align:center; opacity:0.5; font-size:0.8rem; margin-top:10px;">'
+    'لأغراض تعليمية/تحليلية فقط وليس نصيحة استثمارية.</p>',
+    unsafe_allow_html=True,
 )

@@ -50,14 +50,15 @@ def run_backtest(days: int = 1500) -> pd.DataFrame:
 
     btc_price = ds.fetch_btc_price_history(days)
     btc_market = ds.fetch_btc_market_data(days)
-    stable = ds.fetch_stablecoin_supply_history(days)
+    stable_supply = ds.fetch_stablecoin_supply_history(days)
+    stable_inflows = ds.fetch_stablecoin_exchange_inflows(days)
     exch = ds.fetch_btc_exchange_metrics(days)
 
     actual_start = btc_price["date"].min()
     actual_end = btc_price["date"].max()
     print(f"المدى الفعلي للبيانات المتاحة: {actual_start.date()} -> {actual_end.date()}")
 
-    components = fi.build_components_dataframe(stable, exch, btc_market)
+    components = fi.build_components_dataframe(stable_supply, stable_inflows, exch, btc_market)
     result = fi.compute_fomo_index(components)
 
     # تقييم عند الأحداث المعروفة (إن وقعت ضمن المدى المتاح)

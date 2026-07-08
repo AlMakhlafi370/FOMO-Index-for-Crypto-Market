@@ -11,14 +11,21 @@ from dataclasses import dataclass, field
 from typing import Dict
 
 # ----------------------------------------------------------------------------
-# 1) مفاتيح API اختيارية (Pluggable Design)
+# 1) مفاتيح API اختيارية (Pluggable Data Provider Layer)
 # ----------------------------------------------------------------------------
-# المشروع يعمل بالكامل بدون أي مفتاح API (100% مجاني).
-# إذا رغبت لاحقاً باستخدام بيانات مدفوعة أدق (CryptoQuant / Glassnode) لقياس
-# Exchange Netflow و Exchange Balance بشكل حقيقي بدل البروكسي المجاني،
-# ضع المفتاح هنا وسيتحول data_sources.py تلقائياً لاستخدام المصدر الحقيقي.
-CRYPTOQUANT_API_KEY: str = ""   # اتركه فارغاً لاستخدام البديل المجاني (Proxy Mode)
-GLASSNODE_API_KEY: str = ""    # اتركه فارغاً لاستخدام البديل المجاني (Proxy Mode)
+# المشروع يعمل بالكامل بدون أي مفتاح API (100% مجاني) عبر data_providers/.
+# كل مكوّن (Stablecoin Exchange Inflows، BTC Exchange Netflow/Balance) له
+# طبقة مزودين مرتبة من الأدق للأقل دقة (راجع data_providers/*.py):
+#   مدفوع (CryptoQuant/Glassnode/Nansen/Arkham) -> Whale Alert (مجاني بتسجيل)
+#   -> CoinGecko Proxy (مجاني 100% بدون أي تسجيل، الافتراضي).
+# فقط ضع أي مفتاح أدناه ليتحول المشروع تلقائياً لاستخدام مصدر أدق، دون أي
+# تعديل على fomo_index.py أو app.py أو backtest.py.
+CRYPTOQUANT_API_KEY: str = ""   # مزود مدفوع دقيق لـ Exchange Netflow/Balance/Inflows
+GLASSNODE_API_KEY: str = ""     # مزود مدفوع دقيق (بديل لـ CryptoQuant)
+NANSEN_API_KEY: str = ""        # مزود مدفوع دقيق (تتبع محافظ ذكية/منصات)
+ARKHAM_API_KEY: str = ""        # مزود مدفوع دقيق (تتبع كيانات on-chain)
+WHALE_ALERT_API_KEY: str = ""   # مزود مجاني (تسجيل بسيط) لمعاملات حقيقية كبيرة
+WHALE_ALERT_MIN_USD: int = 500_000  # عتبة المعاملة الكبيرة عند استخدام Whale Alert
 
 # ----------------------------------------------------------------------------
 # 2) عناوين مصادر البيانات المجانية (لا تحتاج مفتاح)
@@ -31,8 +38,7 @@ DEFILLAMA_STABLECOINS_BASE = "https://stablecoins.llama.fi"
 # ----------------------------------------------------------------------------
 HISTORY_DAYS_DEFAULT = 365          # مدى البيانات التاريخية المجلوبة افتراضياً
 ROLLING_WINDOW = 180                # نافذة حساب الـ Percentile Rank (تطبيع البيانات)
-SHORT_TERM_WINDOW = 7                # نافذة "التدفقات الجديدة" (Stablecoin Inflows)
-LONG_TERM_WINDOW = 90                # نافذة "نمو المعروض" (Stablecoin Supply)
+LONG_TERM_WINDOW = 90                # نافذة "نمو المعروض" (Stablecoin Supply — سياقي فقط)
 EMA_SPAN_RAW = 5                     # تنعيم البيانات الخام لإزالة الضوضاء اليومية
 EMA_SPAN_FINAL = 3                   # تنعيم المؤشر النهائي
 MAX_DAILY_DELTA = 8.0                # الحد الأقصى لتغيّر المؤشر بين يوم وآخر (منع القفزات الكاذبة)
@@ -40,22 +46,24 @@ MAX_DAILY_DELTA = 8.0                # الحد الأقصى لتغيّر الم
 # ----------------------------------------------------------------------------
 # 4) أوزان مكوّنات المؤشر (تجمع = 1.0)
 # ----------------------------------------------------------------------------
-# الترتيب حسب أهمية العنصر كما طلب المستخدم، مع تبرير كل وزن في README.md
+# مُعاد تصميمها بالكامل لتعكس الفلسفة الصحيحة: قياس دخول الأموال الفعلي
+# إلى منصات التداول، وليس نمو المعروض العالمي (الذي قد لا يدخل المنصات
+# إطلاقاً). راجع القسم 4 في README.md للتبرير الكامل لكل وزن.
 COMPONENT_WEIGHTS: Dict[str, float] = {
-    "stablecoin_inflows": 0.40,   # الأهم: السيولة الجاهزة للشراء (تغيّر قصير المدى بمعروض الستيبل كوين)
-    "btc_exchange_netflow": 0.25, # اتجاه حركة BTC من/إلى المنصات (بروكسي مجاني قابل للاستبدال)
-    "btc_exchange_balance": 0.20, # مستوى رصيد BTC داخل المنصات (تراكمي)
-    "stablecoin_supply": 0.15,    # اتجاه طويل المدى لنمو السيولة الكلية في السوق
+    "stablecoin_exchange_inflows": 0.50,  # الأهم: أموال مستقرة دخلت فعلياً منصات التداول (Binance/Bybit/OKX/Coinbase/Kraken) = "أموال جاهزة للشراء" فوراً
+    "btc_exchange_netflow": 0.25,         # اتجاه حركة BTC من/إلى المنصات (سلوك تأكيدي مكمّل)
+    "btc_exchange_balance": 0.15,         # المستوى التراكمي لرصيد BTC داخل المنصات (إشارة أبطأ لكنها أكثر استقراراً)
+    "stablecoin_supply": 0.10,            # سياق كلي فقط (نمو المعروض العالمي) — وزن منخفض عمداً لأنه إشارة غير مباشرة (إصدار ≠ دخول فعلي للسوق)
 }
 
 assert abs(sum(COMPONENT_WEIGHTS.values()) - 1.0) < 1e-9, "مجموع الأوزان يجب أن يساوي 1.0"
 
 # هل اتجاه القيمة الخام "أعلى = فومو أكثر"، أم يحتاج عكس (Invert)؟
 COMPONENT_INVERT: Dict[str, bool] = {
-    "stablecoin_inflows": False,   # نمو أعلى في المعروض = سيولة أكثر = فومو أعلى
-    "btc_exchange_netflow": True,  # خروج BTC من المنصات (قيمة سالبة) = تراكم = فومو أعلى => نعكس
-    "btc_exchange_balance": True,  # انخفاض الرصيد داخل المنصات = تراكم = فومو أعلى => نعكس
-    "stablecoin_supply": False,    # نمو المعروض الكلي = سيولة أكثر = فومو أعلى
+    "stablecoin_exchange_inflows": False,  # دخول أموال مستقرة أكثر للمنصات = فومو أعلى
+    "btc_exchange_netflow": True,   # خروج BTC من المنصات (قيمة سالبة) = تراكم = فومو أعلى => نعكس
+    "btc_exchange_balance": True,   # انخفاض الرصيد داخل المنصات = تراكم = فومو أعلى => نعكس
+    "stablecoin_supply": False,     # نمو المعروض الكلي = سيولة أكثر بشكل عام = فومو أعلى (إشارة سياقية ضعيفة)
 }
 
 # ----------------------------------------------------------------------------
@@ -65,15 +73,22 @@ COMPONENT_INVERT: Dict[str, bool] = {
 class ZoneConfig:
     low: float
     high: float
-    label_ar: str
+    label_en: str        # التصنيف المعروض في الواجهة (أسلوب Fear & Greed Index)
+    label_ar: str         # تصنيف عربي تفصيلي يُستخدم في التوثيق/السجلات فقط
     color: str
+    explanation_ar: str   # تفسير قصير (سطر إلى سطرين) يظهر أسفل العداد مباشرة
 
 INDEX_ZONES = [
-    ZoneConfig(0, 20, "يأس شديد (Extreme Apathy)", "#2E7D32"),
-    ZoneConfig(20, 40, "خوف / عزوف (Fear)", "#66BB6A"),
-    ZoneConfig(40, 60, "محايد (Neutral)", "#FFC107"),
-    ZoneConfig(60, 80, "FOMO مرتفع (Elevated FOMO)", "#FB8C00"),
-    ZoneConfig(80, 101, "FOMO شديد (Extreme FOMO)", "#D32F2F"),
+    ZoneConfig(0, 20, "Very Low", "يأس شديد (Extreme Apathy)", "#2E7D32",
+               "لا توجد أموال جديدة تدخل السوق حالياً — مرحلة عزوف قد تكون فرصة تجميع."),
+    ZoneConfig(20, 40, "Low", "خوف / عزوف (Fear)", "#66BB6A",
+               "تدفقات الأموال الحقيقية ضعيفة — السوق لا يزال بعيداً عن الفومو."),
+    ZoneConfig(40, 60, "Neutral", "محايد (Neutral)", "#FFC107",
+               "تدفقات الأموال متوازنة — لا توجد إشارة فومو أو يأس واضحة حالياً."),
+    ZoneConfig(60, 80, "High", "FOMO مرتفع (Elevated FOMO)", "#FB8C00",
+               "أموال جديدة بدأت تدخل السوق بوتيرة ملحوظة — ارفع درجة الحذر."),
+    ZoneConfig(80, 101, "Extreme FOMO", "FOMO شديد (Extreme FOMO)", "#D32F2F",
+               "تدفقات أموال كبيرة وواضحة تدخل السوق — فومو حقيقي ومرتفع جداً حالياً."),
 ]
 
 def get_zone(value: float) -> ZoneConfig:
@@ -83,11 +98,15 @@ def get_zone(value: float) -> ZoneConfig:
     return INDEX_ZONES[-1] if value >= 100 else INDEX_ZONES[0]
 
 # ----------------------------------------------------------------------------
-# 6) إعدادات عامة للواجهة
+# 6) إعدادات عامة للواجهة — صفحة واحدة، بدون أي تدخل من المستخدم
 # ----------------------------------------------------------------------------
-APP_TITLE = "FOMO Index — مؤشر الفومو الحقيقي لسوق العملات الرقمية"
-CACHE_TTL_SECONDS = 300   # 5 دقائق قبل إعادة جلب البيانات
-DEFAULT_DARK_MODE = True
+APP_TITLE = "FOMO Index"
+CACHE_TTL_SECONDS = 3600            # ساعة كاملة — يطابق التحديث التلقائي المطلوب
+AUTO_REFRESH_SECONDS = 3600         # تحديث المتصفح تلقائياً كل ساعة (meta refresh)
+CHART_DISPLAY_DAYS = 30             # الرسم البياني يعرض آخر 30 يوماً فقط
+FETCH_DAYS_FOR_CALCULATION = 250    # نجلب مدى أطول من هذا لضمان دقة نافذة 180 يوماً
+                                     # للتطبيع + نافذة 90 يوماً لمكوّن Stablecoin Supply،
+                                     # لكن الواجهة تعرض فقط آخر CHART_DISPLAY_DAYS يوماً.
 
 # رموز/عملات مرجعية
 REFERENCE_COIN_ID = "bitcoin"   # معرف CoinGecko
